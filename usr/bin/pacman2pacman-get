@@ -1,7 +1,8 @@
 #! /bin/bash
 # /usr/bin/pacman2pacman-get
 #
-# Copyright (C) 2022 Joseph Graham <joseph@xylon.me.uk>
+# Copyright (C) 2022 Michael Bolden <me@sm9.dev>
+# Copyright (C) 2014,2017 Joseph Graham <joseph@xylon.me.uk>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
