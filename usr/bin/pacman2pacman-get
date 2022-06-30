@@ -1,0 +1,366 @@
+#! /bin/bash
+# /usr/bin/pacman2pacman-get
+#
+# Copyright (C) 2022 Joseph Graham <joseph@xylon.me.uk>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+TEXTDOMAIN=pacman2pacman-get
+
+debugmode=0
+[[ ${3} == "-d" ]] && debugmode=1 # if 3rd arg is "-d", enable debug mode
+
+echoerr() { cat <<< "$@" 1>&2; } # print errors to stdout
+
+(( debugmode )) && echoerr "pacman2pacman-get invoked"
+
+shopt -s extglob
+
+torrent_folder='/srv/pacman2pacman/torrents'
+
+prog_check_freq=1.4  # seconds to update download progress
+
+torrent_search_time=6  # seconds to spend scanning the mirrors for a torrent
+
+# Check that the args are not empty.
+[[ -z ${1} ]] && { echoerr $"The first argument should be the download url." ; exit 1 ; }
+[[ -z ${2} ]] && { echoerr $"The second argument should be the local filename, plus a \".part\" extension." ; exit 1 ; }
+
+# Pacman2pacman should be called like this from /etc/pacman.conf:
+# XferCommand = /usr/bin/pacman2pacman-get %u %o
+
+url="${1}"  # The download url.
+filename="${2}"  # This is where the downloaded file needs to be saved
+                 # or hardlinked
+
+# Find out the cache location
+pkg_cache_location="${filename%/*}/"
+
+# Read the config
+source /etc/pacman2pacman.conf
+
+# Check if transmission daemon is running.
+if ! pidof transmission-daemon > /dev/null
+   then
+    echoerr $"Error: The transmission daemon is not running."
+    exit 1
+fi
+
+cd "${torrent_folder}"
+
+# Find the name of the package that will be displayed
+pname="${url##*/}"
+pname="${pname%%-[[:digit:]]*}"
+
+# Find out if it's a dbfile
+if [[ "${url}" == *'.db' ]] || [[ "${url}" == *'.db.sig' ]]
+then
+    dbfile=1
+else
+    dbfile=0
+fi
+
+fifoname="${TMPDIR-/tmp}/pacman2pacmanpipe"
+
+exittidy() { rm -rf "${fifoname}" "${TMPDIR-/tmp}/pacman2pacman_torrents"* ; }
+
+# Check for a .torrent.
+
+# We will cycle through the mirrors in the mirrorlist, trying to get
+# the torrent file for this package. If it fails we keep trying more
+# mirrors until we get a 404 or a success, because only a 404
+# indicates that the .torrent does not exist.
+
+mkfifo "${fifoname}"
+
+function look_for_torrent()
+{
+    local torrent_url="${1}"
+    local tfile="$(mktemp ${TMPDIR-/tmp}/pacman2pacman_torrents.XXXXXXXXXX)"
+    
+    (( debugmode )) && echoerr "Looking for torrent at: '${torrent_url}'"
+
+    # Attempt to download the torrent
+    curl -o "${tfile}" -f -L -s -A 'Pacman2pacman' -m 10 "${torrent_url}"
+    local curlstat="${?}"
+
+    # Did curl download a torrent?
+    if [[ "${curlstat}" == 0 ]] && grep "mktorrent" "${tfile}" &>/dev/null
+    then
+	(( debugmode )) && echoerr "Found torrent"
+        echo "found_torrent:${tfile}" > "${fifoname}"
+    fi
+}
+
+# If it's a .db file then we don't even check for a .torrent
+if (( dbfile ))
+then
+    response='httptime'
+else
+    response='torrenttime'
+    # OK so for three random mirrors we look for a torrent. The first
+    # one that responds, we use it. Give up and go to HTTP after 6 seconds.
+    while read mirror
+    do
+        # Remove the `Server = ' part, whether it has spaces or not
+        mirror="${mirror##Server?( )=?( )}"
+
+        torrent_url="${mirror%%\$*}torrents/${url##*/}.torrent"
+
+        look_for_torrent "${torrent_url}" &
+
+    done < <(grep '^Server \?= \?' "${mirrorlist_location}" | shuf | head -n 3)
+
+    # Get the name of the torrent downloaded
+    read -t 6 response < <(cat "${fifoname}")
+
+    (( debugmode )) && echoerr "response var: '${response}'"
+fi
+
+# We were looking for a torrent, but we didn't find one :o
+[[ "${response}" == 'torrenttime' ]] && echo $"Can't find a torrent file for this package :S"
+
+gotourbaby=0  # to record if we've got the torrent yet.
+
+# If there's a .torrent we download the package with transmission
+# otherwize we just download it by http.
+if [[ "${response}" == 'found_torrent:'* ]]
+then
+    gotourbaby=1  # assume success unless proven otherwize
+
+    cd "${pkg_cache_location}"
+
+    # Re-write the webseeds in the torrent to make it use the user's
+    # own mirror. We can just use the ${url} var.
+
+    # The filename of the torrent
+    torntname="${torrent_folder}/${url##*/}.torrent"
+
+    # Move the torrent to the correct location
+    mv "${response#found_torrent:}" "${torntname}"
+    
+    # We need to find out the length of the ${url} var.
+    len="${#url}"
+
+    sed "s#url-list[[:digit:]]\+.\+.pkg.tar.xz#url-list${len}:${url}#" < "${torntname}" > "${torntname}.modified"
+
+    mv "${torntname}.modified" "${torntname}"
+
+    transmission_output=$(mktemp)
+
+    # If the torrent is already in transmission we remove it because
+    # we want it to be fresh (with current webseed list etc)
+    if id=$(transmission-remote -l | grep "${url##*/}")
+    then
+        transmission-remote -t "${id}" -r
+    fi
+
+    # Add the torrent to transmission
+    (( debugmode )) && transmission-remote -a "${torntname}" -w "${pkg_cache_location}" 2>&1 | tee "${transmission_output}"
+    (( debugmode )) || transmission-remote -a "${torntname}" -w "${pkg_cache_location}" 2>&1 > "${transmission_output}"
+
+    if [[ $? != 0 ]]
+    then
+	echo $"Transmission didn't accept our torrent file - falling back to HTTP"
+	gotourbaby=0
+    else
+	# The torrent is now downloading. To get info about the torrent in
+	# order to display a progress bar we need to know it's id.
+
+	# Find out the id of the torrent
+	id=$(transmission-remote -l | grep "${url##*/}")
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"
+	id="${id## }"  # Once should be enough but somehow it's not so I do
+                       # it loads of times.
+	id="${id%% *}"
+
+	# If there is an error there will be an asterix displayed on the
+	# end of the id. We must remove it.
+	id="${id%\*}"
+
+	if ! [[ ${id} =~ [[:digit:]] ]]
+	then
+            echoerr "Error, invalid torrent id: '${id}'"
+            exittidy ; exit 1
+	fi
+
+	# Display a progress bar until it's finished and then hardlink it to
+	# the right place.
+	progress='0.0%'
+
+        p2p_download_string=$"Pacman2pacman p2p download: %s: %s   "
+        printf "${p2p_download_string}" "${pname}" "${progress}"
+
+        # time of check, result of check, percentage. of course we didn't check
+        # yet but we're assuming it works for now.
+        starttime=$(date +%s)
+        last_check_percentage='0.0%'
+
+	until [[ "${progress}" == '100%' ]]
+	do
+            timenow=$(date +%s)
+            
+            # This finds the line with the percent done.
+            progress=$(transmission-remote -t "${id}" -i | grep '[[:digit:]]%$' | head -1)
+            progress="${progress##* }"  # Remove stuff we don't want
+
+            # If our percent hasn't changed after the defined time we fall back to HTTP.
+            if (( timenow > ( starttime + stall_time ) )) && [[ "${progress}" == "${last_check_percentage}" ]]
+            then
+                echo  # the previous print was not followed by a newline
+                echo $"Download stalled. Removing torrent from transmission and falling back to HTTP."
+                transmission-remote -t "${id}" -r > /dev/null
+		gotourbaby=0
+		break
+            else
+                printf "\r${p2p_download_string}" "${pname}" "${progress}"
+
+                last_check_percentage="${progress}"
+            fi
+            
+            sleep ${prog_check_freq}
+	done
+
+	echo
+
+	if (( gotourbaby ))
+	then
+	    err_count=0
+	    until mv -f "${pkg_cache_location}/${url##*/}" "${filename}" 2>/dev/null
+	    do
+		if (( err_count > 100 ))
+		then
+                    printf $"error moving \"%s\". removing torrent from transmission and trying by HTTP." "${pkg_cache_location}/${url##*/}"
+		    transmission-remote -t "${id}" -r > /dev/null
+		    gotourbaby=0
+		    break
+		fi
+
+		sleep 0.1
+
+		(( ++ err_count ))
+	    done
+	fi
+    fi
+
+    rm -f "${transmission_output}"
+fi
+
+# If we haven't got the package by this point then we use HTTP.
+if ! (( gotourbaby ))
+then
+    cd "${pkg_cache_location}"
+
+    # There's no .torrent so we download it by just HTTP.
+
+    # We must do some complicated stuff to customise the progress
+    # meter how we want it, to make it consistent with the progress
+    # bar when we download stuff with transmission.
+
+    mod_time=$(stat -c %Y "/srv/pacman2pacman/dbcache/${filename##*/}" 2>/dev/null)
+
+    progress='0.0%'
+
+    http_download_string=$"Pacman2pacman http download: %s: %s   "
+    
+    printf "${http_download_string}" "${pname}" "${progress}"
+
+    # The first loop gets rid of all the backspace and '#'es and
+    # stuff. The second loop isolates the percent done number.
+    {
+        # For dbs we check if they are modified
+        if (( dbfile ))
+        then
+            if [[ -f "/srv/pacman2pacman/dbcache/${filename##*/}" ]]
+            then
+                curl -# -f -L -z "/srv/pacman2pacman/dbcache/${filename##*/}" -o "/srv/pacman2pacman/dbcache/${filename##*/}" -A 'Pacman2pacman' "${url}" 2>&1
+            else
+                curl -# -f -L -o "/srv/pacman2pacman/dbcache/${filename##*/}" -A 'Pacman2pacman' "${url}" 2>&1
+            fi
+        else
+            curl -# -f -L -o "${filename}" -A 'Pacman2pacman' "${url}" 2>&1
+        fi
+    } |
+    while read -N 1 char
+    do
+        [[ "${char}" =~ [[:digit:].%\ ] ]] && echo -n "${char}"
+    done |
+    {
+        while read -d '%' word
+        do
+            progress="${word}%"
+
+            # There's a crazy bug that causes it to display 100% at the
+            # start of the download. This should fix it.
+            [[ "${progress}" == '100.0%' ]] && continue
+
+            printf "\r${http_download_string}" "${pname}" "${progress}"
+        done
+
+        # It's the end of the download so we can now display 100%
+        if [[ "${progress}" == '100.0%' ]]
+        then
+            progress='100%'
+            printf "\r${http_download_string}" "${pname}" "${progress}"
+        fi
+    }
+
+    # What was the result of the download?
+    if (( dbfile ))
+    then
+        # If we fail to stat it that means it doesn't exist so the
+        # download failed.
+        if ! new_mod_time=$(stat -c %Y "/srv/pacman2pacman/dbcache/${filename##*/}" 2>/dev/null)
+        then
+            progress='failed'
+            printf "\r${http_download_string}" "${pname}" "${progress}"
+
+        # If the file was not modified we display such
+        elif [[ "${new_mod_time}" == "${mod_time}" ]]
+        then
+            progress='file not modified'
+            printf "\r${http_download_string}" "${pname}" "${progress}"
+        fi
+    else
+        # It's not a dbfile. Just check the output file exists.
+        if ! [[ -f "${filename}" ]]
+        then
+            progress='failed'
+            printf "\r${http_download_string}" "${pname}" "${progress}"
+        fi
+    fi
+ 
+    echo
+
+    if (( dbfile )) && [[ -f "/srv/pacman2pacman/dbcache/${filename##*/}" ]]
+    then
+        cp "/srv/pacman2pacman/dbcache/${filename##*/}" "${filename}" 2>/dev/null
+    fi
+
+    [[ -f "${filename}" ]] || { exittidy ; exit 1 ; }
+
+fi
+
+exittidy
+
+exit
