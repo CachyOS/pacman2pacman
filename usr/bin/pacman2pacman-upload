@@ -1,0 +1,104 @@
+#! /bin/bash
+# /usr/bin/pacman2pacman-upload
+#
+# Copyright (C) 2022 Michael Bolden <me@sm9.dev>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+echoerr() { cat <<< "$@" 1>&2; } # print errors to stdout
+
+shopt -s extglob
+
+# Check that the args are not empty.
+[[ -z ${1} ]] && { echoerr $"The first argument should be the local filename." ; exit 1 ; }
+[[ -z ${2} ]] && { echoerr $"The second argument should be the directory where the torrent file is stored." ; exit 1 ; }
+
+file="${1}"  # This is the file that is going to be created and seeded as a torrent.
+
+if [ ! -f "$file" ]
+then
+    echoerr $"Error: File $file does not exist."
+    exit 1
+fi
+
+file_name=$(basename "${file}") # This is the file name without the path.
+file_dir="${file%/*}/" # This is the directory where the file resides.
+
+torrent_dir="${2}"  # This is the directory where the torrent file will be placed.
+
+if [ ! -d "$torrent_dir" ]
+then
+    echoerr $"Error: Directory $torrent_dir does not exist."
+    exit 1
+fi
+
+torrent="$torrent_dir/$file_name.torrent" # This is the full path to the torrent including file name.
+
+# Read the config
+source /etc/pacman2pacman.conf
+
+# Check if transmission daemon is running.
+if ! pidof transmission-daemon > /dev/null 
+then
+    echoerr $"Error: The transmission daemon is not running."
+    exit 1
+fi
+
+# Download a fresh list of working trackers.
+tracker_temp=$(mktemp)
+curl -o "$tracker_temp" https://newtrackon.com/api/stable
+
+# Store the list of trackers into an array.
+declare -a trackers_array
+trackers_array=($(cat "$tracker_temp"))
+trackers_string=""
+
+# Now we will check if the torrent file exists.
+# If it does then we will grab its ID and update its trackers.
+# Otherwise we will create a mew torrent and add it.
+create_torrent=false
+
+if [ -f "$torrent" ]
+then 
+    hash="$( transmission-show "$torrent"  | perl -n -E 'say $1 if /^\s*Hash: (.+)$/' )"
+    id="$(transmission-remote -t "$hash" -i | perl -n -E 'say $1 if /^\s*Id: ([0-9]+)$/' )"
+
+    if [ "$id" ]
+    then
+        echo "Torrent already exists, updating trackers"
+
+        # Iterate over trackers and build the string of arguments.
+        for (( i = 1 ; i < ${#trackers_array[@]} ; i++))
+        do
+            transmission-remote --torrent "$id" -td "${trackers_array[$i]}" > /dev/null
+        done
+
+    else 
+        create_torrent=true
+    fi
+else 
+    create_torrent=true
+fi
+
+# Create and add torrent if needed.
+if [ "$create_torrent" = true ] ; then
+    # Iterate over trackers and build the string of arguments.
+    for (( i = 1 ; i < ${#trackers_array[@]} ; i++))
+    do
+        trackers_string="$trackers_string -t ${trackers_array[$i]}"
+    done
+
+    transmission-create "$file" $trackers_string --outfile "$torrent"
+    transmission-remote --add "$torrent" --download-dir "$file_dir"
+fi
