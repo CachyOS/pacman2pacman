@@ -16,29 +16,33 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-echoerr() { cat <<< "$@" 1>&2; } # print errors to stdout
+echoerr() { cat <<<"$@" 1>&2; } # print errors to stdout
 
 shopt -s extglob
 
 # Check that the args are not empty.
-[[ -z ${1} ]] && { echoerr $"The first argument should be the local filename." ; exit 1 ; }
-[[ -z ${2} ]] && { echoerr $"The second argument should be the directory where the torrent file is stored." ; exit 1 ; }
+[[ -z ${1} ]] && {
+    echoerr $"The first argument should be the local filename."
+    exit 1
+}
+[[ -z ${2} ]] && {
+    echoerr $"The second argument should be the directory where the torrent file is stored."
+    exit 1
+}
 
-file="${1}"  # This is the file that is going to be created and seeded as a torrent.
+file="${1}" # This is the file that is going to be created and seeded as a torrent.
 
-if [ ! -f "$file" ]
-then
+if [ ! -f "$file" ]; then
     echoerr $"Error: File $file does not exist."
     exit 1
 fi
 
 file_name=$(basename "${file}") # This is the file name without the path.
-file_dir="${file%/*}/" # This is the directory where the file resides.
+file_dir="${file%/*}/"          # This is the directory where the file resides.
 
-torrent_dir="${2}"  # This is the directory where the torrent file will be placed.
+torrent_dir="${2}" # This is the directory where the torrent file will be placed.
 
-if [ ! -d "$torrent_dir" ]
-then
+if [ ! -d "$torrent_dir" ]; then
     echoerr $"Error: Directory $torrent_dir does not exist."
     exit 1
 fi
@@ -49,8 +53,7 @@ torrent="$torrent_dir/$file_name.torrent" # This is the full path to the torrent
 source /etc/pacman2pacman.conf
 
 # Check if transmission daemon is running.
-if ! pidof transmission-daemon > /dev/null 
-then
+if ! pidof transmission-daemon >/dev/null; then
     echoerr $"Error: The transmission daemon is not running."
     exit 1
 fi
@@ -69,33 +72,29 @@ trackers_string=""
 # Otherwise we will create a mew torrent and add it.
 create_torrent=false
 
-if [ -f "$torrent" ]
-then 
-    hash="$( transmission-show "$torrent"  | perl -n -E 'say $1 if /^\s*Hash: (.+)$/' )"
-    id="$(transmission-remote -t "$hash" -i | perl -n -E 'say $1 if /^\s*Id: ([0-9]+)$/' )"
+if [ -f "$torrent" ]; then
+    hash="$(transmission-show "$torrent" | perl -n -E 'say $1 if /^\s*Hash: (.+)$/')"
+    id="$(transmission-remote -t "$hash" -i | perl -n -E 'say $1 if /^\s*Id: ([0-9]+)$/')"
 
-    if [ "$id" ]
-    then
+    if [ "$id" ]; then
         echo "Torrent already exists, updating trackers"
 
-        # Iterate over trackers and build the string of arguments.
-        for (( i = 1 ; i < ${#trackers_array[@]} ; i++))
-        do
-            transmission-remote --torrent "$id" -td "${trackers_array[$i]}" > /dev/null
+        # Iterate over trackers and add them to the torrent.
+        for ((i = 1; i < ${#trackers_array[@]}; i++)); do
+            transmission-remote --torrent "$id" -td "${trackers_array[$i]}" >/dev/null
         done
 
-    else 
+    else
         create_torrent=true
     fi
-else 
+else
     create_torrent=true
 fi
 
 # Create and add torrent if needed.
-if [ "$create_torrent" = true ] ; then
+if [ "$create_torrent" = true ]; then
     # Iterate over trackers and build the string of arguments.
-    for (( i = 1 ; i < ${#trackers_array[@]} ; i++))
-    do
+    for ((i = 1; i < ${#trackers_array[@]}; i++)); do
         trackers_string="$trackers_string -t ${trackers_array[$i]}"
     done
 
